@@ -2,8 +2,6 @@ import os
 import random
 import time
 import sqlite3
-import asyncio
-from aiohttp import web
 
 from telegram import Update, BotCommand
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -253,58 +251,34 @@ async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- COMMAND MENU ----------------
 
-async def set_commands():
+async def set_commands(app):
     await app.bot.set_my_commands([
-        BotCommand("start", "Помощь"),
+        BotCommand("start", "Старт"),
         BotCommand("earn", "Работа"),
-        BotCommand("pay", "Перевод Денег"),
-        BotCommand("daily", " Ежедневный Подарок"),
+        BotCommand("pay", "Перевод"),
+        BotCommand("daily", "Дейли"),
         BotCommand("balance", "Баланс"),
         BotCommand("top", "Топ"),
     ])
 
 
-# ---------------- WEBHOOK ----------------
+# ---------------- MAIN ----------------
 
-async def webhook(request):
-    data = await request.json()
-    update = Update.de_json(data, app.bot)
-    await app.process_update(update)
-    return web.Response(text="ok")
+def main():
+    app = ApplicationBuilder().token(TOKEN).build()
 
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("earn", earn))
+    app.add_handler(CommandHandler("pay", pay))
+    app.add_handler(CommandHandler("daily", daily))
+    app.add_handler(CommandHandler("balance", balance))
+    app.add_handler(CommandHandler("top", top))
 
-async def main():
-    await app.initialize()
-    await app.start()
-    await set_commands()
+    app.post_init = set_commands
 
-    server = web.Application()
-    server.router.add_post("/webhook", webhook)
-
-    runner = web.AppRunner(server)
-    await runner.setup()
-
-    site = web.TCPSite(runner, "0.0.0.0", 5000)
-    await site.start()
-
-    url = f"https://{os.getenv('REPL_SLUG')}.{os.getenv('REPL_OWNER')}.repl.co/webhook"
-    await app.bot.set_webhook(url=url)
-
-    print("🤖 Bot running:", url)
-
-    while True:
-        await asyncio.sleep(3600)
-
-
-# ---------------- HANDLERS ----------------
-
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CommandHandler("earn", earn))
-app.add_handler(CommandHandler("pay", pay))
-app.add_handler(CommandHandler("daily", daily))
-app.add_handler(CommandHandler("balance", balance))
-app.add_handler(CommandHandler("top", top))
+    print("🤖 Bot running (polling mode, Kubernetes ready)")
+    app.run_polling()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

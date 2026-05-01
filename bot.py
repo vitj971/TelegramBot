@@ -15,9 +15,9 @@ TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("BOT_TOKEN не задан")
 
-GLOBAL_CD = 3
-EARN_CD = 3
-DAILY_CD = 24 * 60 * 60
+CD_SHORT = 3
+CD_EARN = 4 * 60 * 60
+CD_DAILY = 24 * 60 * 60
 
 # ---------------- DB ----------------
 
@@ -30,9 +30,11 @@ CREATE TABLE IF NOT EXISTS users (
     username TEXT,
     first_name TEXT,
     balance INTEGER DEFAULT 0,
-    last_daily INTEGER DEFAULT 0,
-    last_action INTEGER DEFAULT 0,
-    last_earn INTEGER DEFAULT 0
+    last_start INTEGER DEFAULT 0,
+    last_balance INTEGER DEFAULT 0,
+    last_pay INTEGER DEFAULT 0,
+    last_earn INTEGER DEFAULT 0,
+    last_daily INTEGER DEFAULT 0
 )
 """)
 conn.commit()
@@ -40,14 +42,13 @@ conn.commit()
 
 def ensure_user(user):
     cur.execute("""
-        INSERT OR IGNORE INTO users (user_id, username, first_name, balance, last_daily, last_action, last_earn)
-        VALUES (?, ?, ?, 0, 0, 0, 0)
+        INSERT OR IGNORE INTO users
+        (user_id, username, first_name, balance, last_start, last_balance, last_pay, last_earn, last_daily)
+        VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0)
     """, (user.id, user.username or "", user.first_name or "Игрок"))
 
     cur.execute("""
-        UPDATE users
-        SET username=?, first_name=?
-        WHERE user_id=?
+        UPDATE users SET username=?, first_name=? WHERE user_id=?
     """, (user.username or "", user.first_name or "Игрок", user.id))
 
     conn.commit()
@@ -55,62 +56,36 @@ def ensure_user(user):
 
 def get_user(user_id):
     cur.execute("""
-        SELECT username, first_name, balance, last_daily, last_action, last_earn
-        FROM users
-        WHERE user_id=?
+        SELECT username, first_name, balance,
+               last_start, last_balance, last_pay, last_earn, last_daily
+        FROM users WHERE user_id=?
     """, (user_id,))
     return cur.fetchone()
 
 
-def update_user(user_id, username, first_name, balance, last_daily, last_action, last_earn):
-    cur.execute("""
-        UPDATE users
-        SET username=?, first_name=?, balance=?, last_daily=?, last_action=?, last_earn=?
-        WHERE user_id=?
-    """, (username, first_name, balance, last_daily, last_action, last_earn, user_id))
+def update_field(user_id, field, value):
+    cur.execute(f"UPDATE users SET {field}=? WHERE user_id=?", (value, user_id))
     conn.commit()
 
 
-def get_top(limit=10):
-    cur.execute("""
-        SELECT username, first_name, balance
-        FROM users
-        ORDER BY balance DESC
-        LIMIT ?
-    """, (limit,))
+def update_balance(user_id, balance):
+    cur.execute("UPDATE users SET balance=? WHERE user_id=?", (balance, user_id))
+    conn.commit()
+
+
+def get_top():
+    cur.execute("SELECT username, first_name, balance FROM users ORDER BY balance DESC LIMIT 10")
     return cur.fetchall()
 
 
-# ---------------- COOLDOWNS ----------------
-
-def global_cd(user_id):
-    cur.execute("SELECT last_action FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    return time.time() - row[0] < GLOBAL_CD
+def check_cd(last_time, cooldown):
+    return time.time() - last_time < cooldown
 
 
-def set_global_cd(user_id):
-    cur.execute("""
-        UPDATE users
-        SET last_action=?
-        WHERE user_id=?
-    """, (int(time.time()), user_id))
-    conn.commit()
-
-
-def earn_cd(user_id):
-    cur.execute("SELECT last_earn FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
-    return time.time() - row[0] < EARN_CD
-
-
-def set_earn_cd(user_id):
-    cur.execute("""
-        UPDATE users
-        SET last_earn=?
-        WHERE user_id=?
-    """, (int(time.time()), user_id))
-    conn.commit()
+def format_time(seconds):
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    return f"{h}ч {m}м"
 
 
 # ---------------- BOT ----------------
@@ -118,39 +93,41 @@ def set_earn_cd(user_id):
 app = ApplicationBuilder().token(TOKEN).build()
 
 
-# ---------------- START ----------------
+# ---------------- COMMANDS ----------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ensure_user(update.effective_user)
-    await update.message.reply_text("👋 Бот готов! /earn /pay /daily /balance /top")
+    user = update.effective_user
+    ensure_user(user)
 
+    data = get_user(user.id)
+    if check_cd(data[3], CD_SHORT):
+        return await update.message.reply_text("⏳ Подожди 3 сек")
 
-# ---------------- BALANCE ----------------
+    update_field(user.id, "last_start", int(time.time()))
+    await update.message.reply_text("👋 Бот работает! /earn /pay /daily /balance /top")
+
 
 async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user)
 
-    if global_cd(user.id):
-        return await update.message.reply_text("⏳ 3 сек")
-    set_global_cd(user.id)
+    data = get_user(user.id)
+    if check_cd(data[4], CD_SHORT):
+        return await update.message.reply_text("⏳ Подожди 3 сек")
 
-    _, _, bal, _, _, _ = get_user(user.id)
-    await update.message.reply_text(f"💰 Баланс: {bal}")
+    update_field(user.id, "last_balance", int(time.time()))
+    await update.message.reply_text(f"💰 Баланс: {data[2]}")
 
-
-# ---------------- EARN (FIXED ANTI-ABUSE) ----------------
 
 async def earn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user)
 
-    if earn_cd(user.id):
-        return await update.message.reply_text("⏳ Подожди 3 сек")
+    data = get_user(user.id)
 
-    set_earn_cd(user.id)
-
-    username, name, bal, _, _, _ = get_user(user.id)
+    if check_cd(data[6], CD_EARN):
+        remaining = CD_EARN - (time.time() - data[6])
+        return await update.message.reply_text(f"⏳ Работать можно через {format_time(remaining)}")
 
     roll = random.random()
 
@@ -165,94 +142,23 @@ async def earn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         coins = random.randint(233, 855)
 
-    bal += coins
+    new_balance = data[2] + coins
 
-    update_user(user.id, username, name, bal, 0, 0, int(time.time()))
+    update_balance(user.id, new_balance)
+    update_field(user.id, "last_earn", int(time.time()))
 
-    await update.message.reply_text(f"💰 {name} получил {coins} Бебракоинов! 🎉")
+    await update.message.reply_text(f"💰 {user.first_name} получил {coins} Бебракоинов! 🎉")
 
-
-# ---------------- PAY ----------------
-
-async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    ensure_user(user)
-
-    if global_cd(user.id):
-        return await update.message.reply_text("⏳ 3 сек")
-    set_global_cd(user.id)
-
-    if not context.args:
-        return await update.message.reply_text("Используй: /pay 100 (reply или @user)")
-
-    try:
-        amount = int(context.args[0])
-    except:
-        return await update.message.reply_text("❌ Неверная сумма")
-
-    if amount < 1 or amount > 1_000_000:
-        return await update.message.reply_text("❌ 1 - 1 000 000")
-
-    sender = get_user(user.id)
-    sender_balance = sender[2]
-
-    if sender_balance < amount:
-        return await update.message.reply_text("❌ Нет денег")
-
-    receiver = None
-
-    if update.message.reply_to_message:
-        receiver = update.message.reply_to_message.from_user
-
-    elif len(context.args) > 1:
-        target = context.args[1].replace("@", "")
-        cur.execute("SELECT user_id FROM users WHERE username=?", (target,))
-        row = cur.fetchone()
-
-        if row:
-            receiver = type("obj", (), {
-                "id": row[0],
-                "username": target,
-                "first_name": target
-            })()
-
-    if not receiver:
-        return await update.message.reply_text("❌ Игрок не найден")
-
-    ensure_user(receiver)
-
-    _, _, receiver_balance, _, _, _ = get_user(receiver.id)
-
-    sender_balance -= amount
-    receiver_balance += amount
-
-    update_user(user.id, user.username or "", user.first_name or "Игрок",
-                sender_balance, 0, 0, int(time.time()))
-
-    update_user(receiver.id, receiver.username or "", receiver.first_name or "Игрок",
-                receiver_balance, 0, 0, 0)
-
-    await update.message.reply_text(
-        f"{user.first_name} дал {amount} Бебракоинов {receiver.first_name} 💸"
-    )
-
-
-# ---------------- DAILY ----------------
 
 async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user)
 
-    if global_cd(user.id):
-        return await update.message.reply_text("⏳ 3 сек")
-    set_global_cd(user.id)
+    data = get_user(user.id)
 
-    username, name, bal, last_daily, _, _ = get_user(user.id)
-    now = int(time.time())
-
-    if now - last_daily < DAILY_CD:
-        rem = DAILY_CD - (now - last_daily)
-        return await update.message.reply_text(f"⏳ Жди {rem//3600}ч {(rem%3600)//60}м")
+    if check_cd(data[7], CD_DAILY):
+        remaining = CD_DAILY - (time.time() - data[7])
+        return await update.message.reply_text(f"⏳ Приходи через {format_time(remaining)}")
 
     roll = random.random()
 
@@ -265,26 +171,74 @@ async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         reward = 750
 
-    bal += reward
+    new_balance = data[2] + reward
 
-    update_user(user.id, username, name, bal, now, 0, 0)
+    update_balance(user.id, new_balance)
+    update_field(user.id, "last_daily", int(time.time()))
 
     if reward == 750:
-        text = f"🍀 Счастливчик {name} получил {reward}!"
+        text = f"🍀 Счастливчик! {user.first_name} получил {reward}!"
     else:
-        text = f"✨ {name} получил {reward} Бебракоинов"
+        text = f"✨ {user.first_name} получил {reward}"
 
     await update.message.reply_text(text)
 
 
-# ---------------- TOP ----------------
+async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    ensure_user(user)
+
+    data = get_user(user.id)
+
+    if check_cd(data[5], CD_SHORT):
+        return await update.message.reply_text("⏳ Подожди 3 сек")
+
+    if not context.args:
+        return await update.message.reply_text("Используй: /pay 100 (reply или @user)")
+
+    try:
+        amount = int(context.args[0])
+    except:
+        return await update.message.reply_text("❌ Неверная сумма")
+
+    if amount < 1 or amount > 1_000_000:
+        return await update.message.reply_text("❌ 1 - 1 000 000")
+
+    sender_balance = data[2]
+
+    if sender_balance < amount:
+        return await update.message.reply_text("❌ Недостаточно средств")
+
+    receiver = None
+
+    if update.message.reply_to_message:
+        receiver = update.message.reply_to_message.from_user
+
+    elif len(context.args) > 1:
+        username = context.args[1].replace("@", "")
+        cur.execute("SELECT user_id FROM users WHERE username=?", (username,))
+        row = cur.fetchone()
+        if row:
+            receiver = type("obj", (), {"id": row[0], "first_name": username})
+
+    if not receiver:
+        return await update.message.reply_text("❌ Игрок не найден")
+
+    ensure_user(receiver)
+
+    rec_data = get_user(receiver.id)
+
+    update_balance(user.id, sender_balance - amount)
+    update_balance(receiver.id, rec_data[2] + amount)
+    update_field(user.id, "last_pay", int(time.time()))
+
+    await update.message.reply_text(
+        f"{user.first_name} дал {amount} Бебракоинов {receiver.first_name} 💸"
+    )
+
 
 async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if global_cd(update.effective_user.id):
-        return await update.message.reply_text("⏳ 3 сек")
-    set_global_cd(update.effective_user.id)
-
-    data = get_top(10)
+    data = get_top()
 
     medals = ["🥇", "🥈", "🥉"]
     text = "🏆 Топ игроков:\n\n"
@@ -297,14 +251,14 @@ async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
-# ---------------- COMMANDS ----------------
+# ---------------- COMMAND MENU ----------------
 
 async def set_commands():
     await app.bot.set_my_commands([
-        BotCommand("start", "Старт"),
-        BotCommand("earn", "Заработок"),
-        BotCommand("pay", "Перевод"),
-        BotCommand("daily", "Дейли"),
+        BotCommand("start", "Помощь"),
+        BotCommand("earn", "Работа"),
+        BotCommand("pay", "Перевод Денег"),
+        BotCommand("daily", " Ежедневный Подарок"),
         BotCommand("balance", "Баланс"),
         BotCommand("top", "Топ"),
     ])
@@ -322,7 +276,6 @@ async def webhook(request):
 async def main():
     await app.initialize()
     await app.start()
-
     await set_commands()
 
     server = web.Application()
@@ -331,14 +284,10 @@ async def main():
     runner = web.AppRunner(server)
     await runner.setup()
 
-    site = web.TCPSite(runner, "0.0.0.0", 10000)
+    site = web.TCPSite(runner, "0.0.0.0", 5000)
     await site.start()
 
-    repl_slug = os.getenv("REPL_SLUG")
-    repl_owner = os.getenv("REPL_OWNER")
-
-    url = f"https://{repl_slug}.{repl_owner}.repl.co/webhook"
-
+    url = f"https://{os.getenv('REPL_SLUG')}.{os.getenv('REPL_OWNER')}.repl.co/webhook"
     await app.bot.set_webhook(url=url)
 
     print("🤖 Bot running:", url)
